@@ -1,115 +1,120 @@
 # .github/workflows/deploy-eks.yml
-# Replaces the Jenkins "release / rollback / remove" Helm pipeline.
+# Manual trigger: Actions -> EKS Deploy (Helm) -> Run workflow
+#
+# Account ID, region and version bucket are NOT in the form. They come from
+# GitHub Environment variables so a dev run can never point at prod values.
+# Set them under Settings -> Environments -> <env> -> Variables:
+#   AWS_ACCOUNT, AWS_REGION, VERSION_BUCKET
 
 name: EKS Deploy (Helm)
 
-run-name: "${{ inputs.ACTION }} ${{ inputs.APP_NAME }} → ${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}"
+run-name: "${{ inputs.ACTION }} ${{ inputs.APP_NAME }} → ${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }} by @${{ github.actor }}"
 
 on:
   workflow_dispatch:
     inputs:
       ACTION:
-        description: "Operation to perform"
+        description: "What to do"
         type: choice
         options: [release, rollback, remove]
         default: release
       APP_NAME:
-        description: "Service name (also the Helm release name)"
-        type: string
-        required: true
+        description: "Service to deploy"
+        type: choice
+        options:
+          # Edit this list to match your services.
+          - user-service
+          - match-service
+          - chat-service
+          - notification-service
+          - media-service
       COUNTRY_CODE:
+        description: "Region code"
         type: choice
         options: [us, in]
         default: us
       ENVIRONMENT:
+        description: "Target environment"
         type: choice
         options: [dev, stage, prod]
         default: dev
-      AWS_REGION:
-        type: choice
-        options: [us-east-1, ap-south-1]
-        default: us-east-1
-      AWS_ACCOUNT:
-        description: "Account ID hosting the ECR repo"
-        type: string
-        required: true
-      VERSION_BUCKET:
-        description: "S3 bucket holding version.txt"
-        type: string
-        required: true
       REPLICA_COUNT:
-        description: "hpa.minReplicas"
-        type: string
-        default: "1"
+        description: "Min replicas (HPA)"
+        type: choice
+        options: ["1", "2", "3", "4", "6", "8"]
+        default: "2"
       GIT_BRANCH:
-        description: "Branch/tag of alk-devops-infra to deploy from"
+        description: "Infra repo branch (leave as main unless testing chart changes)"
         type: string
         default: main
-      RUNNER_LABEL:
-        description: "Runner label. Must be a VPC-resident runner — the EKS API endpoint is private."
-        type: string
-        default: self-hosted
-
-  # Lets service repos call this instead of copy-pasting it.
-  workflow_call:
-    inputs:
-      ACTION:        { type: string, required: true }
-      APP_NAME:      { type: string, required: true }
-      COUNTRY_CODE:  { type: string, required: true }
-      ENVIRONMENT:   { type: string, required: true }
-      AWS_REGION:    { type: string, required: true }
-      AWS_ACCOUNT:   { type: string, required: true }
-      VERSION_BUCKET:{ type: string, required: true }
-      REPLICA_COUNT: { type: string, required: false, default: "1" }
-      GIT_BRANCH:    { type: string, required: false, default: main }
-      RUNNER_LABEL:  { type: string, required: false, default: self-hosted }
-    secrets:
-      AWS_ROLE_ARN:      { required: true }
-      INFRA_REPO_TOKEN:  { required: false }
-      SLACK_WEBHOOK_URL: { required: false }
+      DRY_RUN:
+        description: "Render and diff only, do not apply"
+        type: boolean
+        default: false
 
 permissions:
-  id-token: write      # required for OIDC role assumption
+  id-token: write
   contents: read
 
-# Serialise deploys per app+env; queue rather than cancel mid-Helm.
 concurrency:
   group: eks-deploy-${{ inputs.APP_NAME }}-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: "${{ inputs.ACTION }} ${{ inputs.APP_NAME }}"
-    runs-on: ${{ inputs.RUNNER_LABEL }}
-    # Attach reviewers/wait timers to this environment for approval gating.
+    name: "${{ inputs.ACTION }} ${{ inputs.APP_NAME }} (${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }})"
+
+    # Runner. For CodeBuild-hosted runners use instead:
+    # runs-on: codebuild-${{ vars.CODEBUILD_PROJECT }}-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'self-hosted' }}
+
+    # Drives which set of variables/secrets apply, and where approval gates hang.
     environment: ${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}
+
     env:
       NAMESPACE: ${{ inputs.APP_NAME }}-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}
       CLUSTER_NAME: eks-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}
-      ECR_REPO: ${{ inputs.AWS_ACCOUNT }}.dkr.ecr.${{ inputs.AWS_REGION }}.amazonaws.com/${{ inputs.APP_NAME }}-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}
+      AWS_ACCOUNT: ${{ vars.AWS_ACCOUNT }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      VERSION_BUCKET: ${{ vars.VERSION_BUCKET }}
+      ECR_REPO: ${{ vars.AWS_ACCOUNT }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ inputs.APP_NAME }}-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
     steps:
+      # Fail in 5 seconds with a clear message rather than 3 minutes into helm
+      # with an empty account ID in the image repository.
+      - name: Validate environment configuration
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${AWS_ACCOUNT}" ]    || missing+=("AWS_ACCOUNT")
+          [ -n "${AWS_REGION}" ]     || missing+=("AWS_REGION")
+          [ -n "${VERSION_BUCKET}" ] || missing+=("VERSION_BUCKET")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing variables on environment '${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}': ${missing[*]}"
+            echo "::error::Set them under Settings > Environments > ${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }} > Variables"
+            exit 1
+          fi
+          echo "account=${AWS_ACCOUNT} region=${AWS_REGION} cluster=${CLUSTER_NAME} ns=${NAMESPACE}"
+
       - name: Checkout alk-devops-infra
         uses: actions/checkout@v4
         with:
           repository: XVISION-IT-PRIVATE-LIMITED/alk-devops-infra
           ref: ${{ inputs.GIT_BRANCH }}
-          token: ${{ secrets.INFRA_REPO_TOKEN || github.token }}
           persist-credentials: false
 
-      # Per-run kubeconfig + values path. Keeps concurrent runs on a
-      # self-hosted runner from stomping on each other's context.
       - name: Prepare run paths
         run: |
           echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
           echo "VALUES_FILE=$RUNNER_TEMP/values-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}.yaml" >> "$GITHUB_ENV"
 
+      # Remove this step if using CodeBuild runners (service role supplies creds).
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ inputs.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-${{ inputs.APP_NAME }}-${{ github.run_id }}
 
       - name: Install kubectl
@@ -125,36 +130,30 @@ jobs:
       - name: Update kubeconfig
         run: |
           set -euo pipefail
-          aws eks update-kubeconfig \
-            --name "$CLUSTER_NAME" \
-            --region "${{ inputs.AWS_REGION }}" \
-            --alias "$CLUSTER_NAME"
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$CLUSTER_NAME"
           kubectl config use-context "$CLUSTER_NAME"
-          kubectl version --output=yaml | head -n 20
 
       - name: Ensure namespace
         if: inputs.ACTION != 'remove'
-        run: |
-          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+        run: kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Fetch chart values from Secrets Manager
+      - name: Fetch chart values
         if: inputs.ACTION == 'release'
         run: |
           set -euo pipefail
           umask 077
           aws secretsmanager get-secret-value \
             --secret-id "values-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}" \
-            --region "${{ inputs.AWS_REGION }}" \
+            --region "$AWS_REGION" \
             --query SecretString --output text > "$VALUES_FILE"
           test -s "$VALUES_FILE"
-          echo "values file written: $(wc -l < "$VALUES_FILE") lines"
 
       - name: Resolve app version
         if: inputs.ACTION == 'release'
         run: |
           set -euo pipefail
           aws s3 cp \
-            "s3://${{ inputs.VERSION_BUCKET }}/${{ inputs.COUNTRY_CODE }}/${{ inputs.ENVIRONMENT }}/${{ inputs.APP_NAME }}/version.txt" \
+            "s3://${VERSION_BUCKET}/${{ inputs.COUNTRY_CODE }}/${{ inputs.ENVIRONMENT }}/${{ inputs.APP_NAME }}/version.txt" \
             "$RUNNER_TEMP/version.txt"
           APP_VERSION="$(tr -d ' \r\n' < "$RUNNER_TEMP/version.txt")"
           if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -162,19 +161,22 @@ jobs:
             exit 1
           fi
           echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
-          echo "deploying $APP_VERSION"
 
       - name: Set chart appVersion
         if: inputs.ACTION == 'release'
         run: |
-          set -euo pipefail
           sed -i "s/^appVersion:.*/appVersion: ${APP_VERSION}/" helm/app/Chart.yaml
-          cat helm/app/Chart.yaml
 
       - name: Helm release
         if: inputs.ACTION == 'release'
         run: |
           set -euo pipefail
+          EXTRA=""
+          if [ "${{ inputs.DRY_RUN }}" = "true" ]; then
+            EXTRA="--dry-run"
+            echo "::notice::DRY RUN — nothing will be applied"
+          fi
+
           helm upgrade --install "${{ inputs.APP_NAME }}" helm/app \
             --namespace "$NAMESPACE" \
             --create-namespace \
@@ -186,12 +188,12 @@ jobs:
             --set image.pullPolicy=Always \
             --set hpa.minReplicas="${{ inputs.REPLICA_COUNT }}" \
             --values "$VALUES_FILE" \
-            --atomic --timeout 300s
+            --atomic --timeout 300s $EXTRA
 
-          # Carried over from the Jenkins job. --atomic already waits for the
-          # release to converge, so this is only needed while image.tag=latest.
-          kubectl rollout restart deployment/"$NAMESPACE" -n "$NAMESPACE"
-          kubectl rollout status  deployment/"$NAMESPACE" -n "$NAMESPACE" --timeout=180s
+          if [ "${{ inputs.DRY_RUN }}" != "true" ]; then
+            kubectl rollout restart deployment/"$NAMESPACE" -n "$NAMESPACE"
+            kubectl rollout status  deployment/"$NAMESPACE" -n "$NAMESPACE" --timeout=180s
+          fi
 
       - name: Helm rollback
         if: inputs.ACTION == 'rollback'
@@ -202,9 +204,7 @@ jobs:
 
       - name: Helm uninstall
         if: inputs.ACTION == 'remove'
-        run: |
-          set -euo pipefail
-          helm uninstall "${{ inputs.APP_NAME }}" -n "$NAMESPACE" --wait --timeout 300s
+        run: helm uninstall "${{ inputs.APP_NAME }}" -n "$NAMESPACE" --wait --timeout 300s
 
       - name: Job summary
         if: always()
@@ -216,8 +216,11 @@ jobs:
             echo "| --- | --- |"
             echo "| Cluster | \`$CLUSTER_NAME\` |"
             echo "| Namespace | \`$NAMESPACE\` |"
+            echo "| Account | \`$AWS_ACCOUNT\` |"
             echo "| Version | \`${APP_VERSION:-n/a}\` |"
-            echo "| Branch | \`${{ inputs.GIT_BRANCH }}\` |"
+            echo "| Replicas | ${{ inputs.REPLICA_COUNT }} |"
+            echo "| Dry run | ${{ inputs.DRY_RUN }} |"
+            echo "| Triggered by | @${{ github.actor }} |"
             echo "| Result | ${{ job.status }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -242,8 +245,6 @@ jobs:
              }')
           curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
 
-      # Equivalent of cleanWs() — matters on self-hosted runners.
       - name: Clean up
         if: always()
-        run: |
-          rm -f "${VALUES_FILE:-}" "${KUBECONFIG:-}" "$RUNNER_TEMP/version.txt" || true
+        run: rm -f "${VALUES_FILE:-}" "${KUBECONFIG:-}" "$RUNNER_TEMP/version.txt" || true
