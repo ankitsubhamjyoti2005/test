@@ -6,7 +6,7 @@
 # Set them under Settings -> Environments -> <env> -> Variables:
 #   AWS_ACCOUNT, AWS_REGION, VERSION_BUCKET
 
-name: EKS Deploy (Helm)
+name: EKS
 
 run-name: "${{ inputs.ACTION }} ${{ inputs.APP_NAME }} → ${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }} by @${{ github.actor }}"
 
