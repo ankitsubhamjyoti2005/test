@@ -1,0 +1,250 @@
+# .github/workflows/deploy-eks.yml
+# Manual trigger: Actions -> EKS Deploy (Helm) -> Run workflow
+#
+# Account ID, region and version bucket are NOT in the form. They come from
+# GitHub Environment variables so a dev run can never point at prod values.
+# Set them under Settings -> Environments -> <env> -> Variables:
+#   AWS_ACCOUNT, AWS_REGION, VERSION_BUCKET
+
+name: EKS Deploy (Helm)
+
+run-name: "${{ inputs.ACTION }} ${{ inputs.APP_NAME }} → ${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }} by @${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ACTION:
+        description: "What to do"
+        type: choice
+        options: [release, rollback, remove]
+        default: release
+      APP_NAME:
+        description: "Service to deploy"
+        type: choice
+        options:
+          # Edit this list to match your services.
+          - user-service
+          - match-service
+          - chat-service
+          - notification-service
+          - media-service
+      COUNTRY_CODE:
+        description: "Region code"
+        type: choice
+        options: [us, in]
+        default: us
+      ENVIRONMENT:
+        description: "Target environment"
+        type: choice
+        options: [dev, stage, prod]
+        default: dev
+      REPLICA_COUNT:
+        description: "Min replicas (HPA)"
+        type: choice
+        options: ["1", "2", "3", "4", "6", "8"]
+        default: "2"
+      GIT_BRANCH:
+        description: "Infra repo branch (leave as main unless testing chart changes)"
+        type: string
+        default: main
+      DRY_RUN:
+        description: "Render and diff only, do not apply"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: eks-deploy-${{ inputs.APP_NAME }}-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: "${{ inputs.ACTION }} ${{ inputs.APP_NAME }} (${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }})"
+
+    # Runner. For CodeBuild-hosted runners use instead:
+    # runs-on: codebuild-${{ vars.CODEBUILD_PROJECT }}-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'self-hosted' }}
+
+    # Drives which set of variables/secrets apply, and where approval gates hang.
+    environment: ${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}
+
+    env:
+      NAMESPACE: ${{ inputs.APP_NAME }}-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}
+      CLUSTER_NAME: eks-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}
+      AWS_ACCOUNT: ${{ vars.AWS_ACCOUNT }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      VERSION_BUCKET: ${{ vars.VERSION_BUCKET }}
+      ECR_REPO: ${{ vars.AWS_ACCOUNT }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ inputs.APP_NAME }}-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      # Fail in 5 seconds with a clear message rather than 3 minutes into helm
+      # with an empty account ID in the image repository.
+      - name: Validate environment configuration
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${AWS_ACCOUNT}" ]    || missing+=("AWS_ACCOUNT")
+          [ -n "${AWS_REGION}" ]     || missing+=("AWS_REGION")
+          [ -n "${VERSION_BUCKET}" ] || missing+=("VERSION_BUCKET")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing variables on environment '${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}': ${missing[*]}"
+            echo "::error::Set them under Settings > Environments > ${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }} > Variables"
+            exit 1
+          fi
+          echo "account=${AWS_ACCOUNT} region=${AWS_REGION} cluster=${CLUSTER_NAME} ns=${NAMESPACE}"
+
+      - name: Checkout alk-devops-infra
+        uses: actions/checkout@v4
+        with:
+          repository: XVISION-IT-PRIVATE-LIMITED/alk-devops-infra
+          ref: ${{ inputs.GIT_BRANCH }}
+          persist-credentials: false
+
+      - name: Prepare run paths
+        run: |
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+          echo "VALUES_FILE=$RUNNER_TEMP/values-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}.yaml" >> "$GITHUB_ENV"
+
+      # Remove this step if using CodeBuild runners (service role supplies creds).
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-${{ inputs.APP_NAME }}-${{ github.run_id }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Update kubeconfig
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$CLUSTER_NAME"
+          kubectl config use-context "$CLUSTER_NAME"
+
+      - name: Ensure namespace
+        if: inputs.ACTION != 'remove'
+        run: kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Fetch chart values
+        if: inputs.ACTION == 'release'
+        run: |
+          set -euo pipefail
+          umask 077
+          aws secretsmanager get-secret-value \
+            --secret-id "values-${{ inputs.COUNTRY_CODE }}-${{ inputs.ENVIRONMENT }}" \
+            --region "$AWS_REGION" \
+            --query SecretString --output text > "$VALUES_FILE"
+          test -s "$VALUES_FILE"
+
+      - name: Resolve app version
+        if: inputs.ACTION == 'release'
+        run: |
+          set -euo pipefail
+          aws s3 cp \
+            "s3://${VERSION_BUCKET}/${{ inputs.COUNTRY_CODE }}/${{ inputs.ENVIRONMENT }}/${{ inputs.APP_NAME }}/version.txt" \
+            "$RUNNER_TEMP/version.txt"
+          APP_VERSION="$(tr -d ' \r\n' < "$RUNNER_TEMP/version.txt")"
+          if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version.txt is not semver: '$APP_VERSION'"
+            exit 1
+          fi
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
+      - name: Set chart appVersion
+        if: inputs.ACTION == 'release'
+        run: |
+          sed -i "s/^appVersion:.*/appVersion: ${APP_VERSION}/" helm/app/Chart.yaml
+
+      - name: Helm release
+        if: inputs.ACTION == 'release'
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [ "${{ inputs.DRY_RUN }}" = "true" ]; then
+            EXTRA="--dry-run"
+            echo "::notice::DRY RUN — nothing will be applied"
+          fi
+
+          helm upgrade --install "${{ inputs.APP_NAME }}" helm/app \
+            --namespace "$NAMESPACE" \
+            --create-namespace \
+            --set serviceName="${{ inputs.APP_NAME }}" \
+            --set countryCode="${{ inputs.COUNTRY_CODE }}" \
+            --set envName="${{ inputs.ENVIRONMENT }}" \
+            --set image.repository="$ECR_REPO" \
+            --set image.tag=latest \
+            --set image.pullPolicy=Always \
+            --set hpa.minReplicas="${{ inputs.REPLICA_COUNT }}" \
+            --values "$VALUES_FILE" \
+            --atomic --timeout 300s $EXTRA
+
+          if [ "${{ inputs.DRY_RUN }}" != "true" ]; then
+            kubectl rollout restart deployment/"$NAMESPACE" -n "$NAMESPACE"
+            kubectl rollout status  deployment/"$NAMESPACE" -n "$NAMESPACE" --timeout=180s
+          fi
+
+      - name: Helm rollback
+        if: inputs.ACTION == 'rollback'
+        run: |
+          set -euo pipefail
+          helm history "${{ inputs.APP_NAME }}" -n "$NAMESPACE" --max 10
+          helm rollback "${{ inputs.APP_NAME }}" -n "$NAMESPACE" --wait --timeout 300s
+
+      - name: Helm uninstall
+        if: inputs.ACTION == 'remove'
+        run: helm uninstall "${{ inputs.APP_NAME }}" -n "$NAMESPACE" --wait --timeout 300s
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ inputs.ACTION }} — \`${{ inputs.APP_NAME }}\`"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Cluster | \`$CLUSTER_NAME\` |"
+            echo "| Namespace | \`$NAMESPACE\` |"
+            echo "| Account | \`$AWS_ACCOUNT\` |"
+            echo "| Version | \`${APP_VERSION:-n/a}\` |"
+            echo "| Replicas | ${{ inputs.REPLICA_COUNT }} |"
+            echo "| Dry run | ${{ inputs.DRY_RUN }} |"
+            echo "| Triggered by | @${{ github.actor }} |"
+            echo "| Result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Slack
+        if: always() && env.SLACK_WEBHOOK_URL != ''
+        run: |
+          set -euo pipefail
+          payload=$(jq -n \
+            --arg status "${{ job.status }}" \
+            --arg action "${{ inputs.ACTION }}" \
+            --arg app "${{ inputs.APP_NAME }}" \
+            --arg ns "$NAMESPACE" \
+            --arg version "${APP_VERSION:-n/a}" \
+            --arg actor "${{ github.actor }}" \
+            --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+               channel: "#release-hub",
+               attachments: [{
+                 color: (if $status == "success" then "good" else "danger" end),
+                 text: "*Deployment \($status)*\n*Action*: \($action)\n*App*: \($app)\n*Namespace*: \($ns)\n*Version*: \($version)\n*Triggered by*: \($actor)\n*Run*: <\($url)|Open>"
+               }]
+             }')
+          curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
+
+      - name: Clean up
+        if: always()
+        run: rm -f "${VALUES_FILE:-}" "${KUBECONFIG:-}" "$RUNNER_TEMP/version.txt" || true
